@@ -119,6 +119,7 @@
           :copied-note-server-id="copiedNoteServerId"
           :copied-spec-key="copiedSpecKey"
           @add-server="addServer"
+          @auto-discovery-cmd="openAutoDiscoveryModal"
           @batch-edit="openBatchEditModal"
           @batch-delete="batchDelete"
           @toggle-select-all="toggleSelectAll"
@@ -142,8 +143,6 @@
           :password-visible="passwordVisible"
           :active-tab="activeTab"
           :selected-api-base="selectedApiBase"
-          :auto-discovery-command="autoDiscoveryInstallCommand"
-          :auto-discovery-saved="savedAutoDiscovery"
           :current-origin="currentOrigin"
           :saving="saving"
           :change-admin-password="changeAdminPassword"
@@ -289,6 +288,27 @@
         @update:install-gh-proxy="installGhProxy = $event"
         @update:install-version="installVersion = $event"
         @open-edit-from-copy="openEditModalFromCopy"
+      />
+
+      <AutoDiscoveryCommandModal
+        :trans="trans"
+        :show="showAutoDiscoveryModal"
+        :target-os="autoDiscoveryTargetOs"
+        :install-mode="autoDiscoveryInstallMode"
+        :name="autoDiscoveryName"
+        :version="autoDiscoveryVersion"
+        :auto-update="autoDiscoveryAutoUpdate"
+        :gh-proxy="autoDiscoveryGhProxy"
+        :install-command="getAutoDiscoveryInstallCommand()"
+        :copied="autoDiscoveryCopied"
+        @close="closeAutoDiscoveryModal"
+        @copy-cmd="copyAutoDiscoveryCmd"
+        @update:target-os="autoDiscoveryTargetOs = $event"
+        @update:install-mode="autoDiscoveryInstallMode = $event"
+        @update:name="autoDiscoveryName = $event"
+        @update:version="autoDiscoveryVersion = $event"
+        @update:auto-update="autoDiscoveryAutoUpdate = $event"
+        @update:gh-proxy="autoDiscoveryGhProxy = $event"
       />
 
       <div id="dbModal" class="modal-overlay" :class="{ active: showDbModal }">
@@ -590,10 +610,11 @@ import EditServerModal from './components/EditServerModal.vue'
 import BatchEditServersModal from './components/BatchEditServersModal.vue'
 import DeleteServerModal from './components/DeleteServerModal.vue'
 import CopyCommandModal from './components/CopyCommandModal.vue'
+import AutoDiscoveryCommandModal from './components/AutoDiscoveryCommandModal.vue'
 import { adminApi, login, logout as apiLogout, upgradeDatabase, clearHistory, fetchConfig } from '../../utils/api'
 import { hasMultipleApiBases, getApiBases } from '../../utils/config.js'
 import { copyTextToClipboard } from '../../utils/clipboard.js'
-import { t, useTranslation } from '../../utils/i18n'
+import { normalizeLanguagePreference, normalizeNotificationLanguagePreference, t, useTranslation } from '../../utils/i18n'
 import { PING_NODE_FIELDS, validatePingNode } from '../../utils/pingNode.js'
 import { normalizeDisplayMode, resolveDisplayMode } from '../../utils/displayMode.js'
 import { applyMikusThemeOptions } from '../../utils/themeOptions.js'
@@ -761,16 +782,23 @@ const normalizeResourceAlertIntervalSetting = (value) => {
 
 const normalizeResourceAlertMetricSetting = (value) => {
   const metric = String(value || '').trim()
-  return ['cpu', 'ram', 'disk', 'netIn', 'netOut'].includes(metric) ? metric : 'cpu'
+  return ['cpu', 'ram', 'disk', 'netIn', 'netOut', 'tcpConn', 'udpConn'].includes(metric) ? metric : 'cpu'
 }
 
-const defaultResourceAlertThreshold = (metric) => (
-  metric === 'netIn' || metric === 'netOut' ? '100' : '80'
-)
+const isConnectionAlertMetricSetting = (metric) => metric === 'tcpConn' || metric === 'udpConn'
+
+const defaultResourceAlertThreshold = (metric) => {
+  if (isConnectionAlertMetricSetting(metric)) return '1000'
+  return metric === 'netIn' || metric === 'netOut' ? '100' : '80'
+}
 
 const normalizeResourceAlertThresholdSetting = (value, metric) => {
   if (value === undefined || value === null || value === '') return defaultResourceAlertThreshold(metric)
   const number = Number(value)
+  if (isConnectionAlertMetricSetting(metric)) {
+    if (!Number.isFinite(number) || number <= 0 || number > 10000000) return defaultResourceAlertThreshold(metric)
+    return String(Math.round(number))
+  }
   const max = metric === 'netIn' || metric === 'netOut' ? 100000 : 100
   if (!Number.isFinite(number) || number <= 0 || number > max) return defaultResourceAlertThreshold(metric)
   return String(Math.round(number * 100) / 100)
@@ -821,15 +849,9 @@ const normalizePreferredThemeSetting = (value) => {
   return ['dark', 'light', 'auto'].includes(theme) ? theme : 'auto'
 }
 
-const normalizeDefaultLanguageSetting = (value) => {
-  const language = String(value || '').trim().toLowerCase()
-  return ['zh', 'en', 'es', 'auto'].includes(language) ? language : 'auto'
-}
+const normalizeDefaultLanguageSetting = (value) => normalizeLanguagePreference(value)
 
-const normalizeNotificationLanguageSetting = (value) => {
-  const language = String(value || '').trim().toLowerCase()
-  return ['zh', 'en', 'es'].includes(language) ? language : 'zh'
-}
+const normalizeNotificationLanguageSetting = (value) => normalizeNotificationLanguagePreference(value)
 
 const formatThemeOptions = (value) => {
   const normalized = value === undefined || value === null ? {} : value
@@ -984,7 +1006,8 @@ const settings = ref({
   custom_bd_name: 'BGP',
   theme_url: '',
   csp_static: '',
-  csp_api: ''
+  csp_api: '',
+  ua: 'cfsm'
 })
 const apiSecret = ref('')
 const cacheRefreshing = ref(false)
@@ -1010,7 +1033,7 @@ const toggleAdminPasswordChange = () => {
 }
 
 const { visibility: passwordVisible, toggle: togglePassword } = usePasswordVisibility([
-  'login', 'tgBotToken', 'tgChatId', 'notificationWebhookUrl', 'smtpPassword', 'turnstileSecret', 'cloudflareToken', 'jwtSecret', 'password', 'confirmPassword'
+  'login', 'tgBotToken', 'tgChatId', 'notificationWebhookUrl', 'smtpPassword', 'turnstileSecret', 'cloudflareToken', 'jwtSecret', 'ua', 'password', 'confirmPassword'
 ])
 
 const {
@@ -1149,6 +1172,14 @@ const rxCorrection = ref('')
 const txCorrection = ref('')
 const autoUpdate = ref(false)
 const copiedCmd = ref(false)
+const showAutoDiscoveryModal = ref(false)
+const autoDiscoveryTargetOs = ref('linux')
+const autoDiscoveryInstallMode = ref('current-user')
+const autoDiscoveryName = ref('')
+const autoDiscoveryVersion = ref('')
+const autoDiscoveryAutoUpdate = ref(false)
+const autoDiscoveryGhProxy = ref('')
+const autoDiscoveryCopied = ref(false)
 
 const isWssReportEnabled = computed(() => settings.value.wss_report_enabled === true)
 const getEffectiveConnectionMode = (value) => {
@@ -1431,7 +1462,8 @@ const loadSettings = async () => {
         node_1_name: settingsData.node_1_name || 'Node 1', node_2_name: settingsData.node_2_name || 'Node 2', node_3_name: settingsData.node_3_name || 'Node 3', node_4_name: settingsData.node_4_name || 'Node 4',
         theme_url: settingsData.theme_url || '',
         csp_static: settingsData.csp_static || '',
-        csp_api: settingsData.csp_api || ''
+        csp_api: settingsData.csp_api || '',
+        ua: settingsData.ua || 'cfsm'
       }
       applyMikusThemeOptions(settingsData.theme_options)
       changeAdminPassword.value = !settings.value.password_configured || !String(settings.value.username || '').trim()
@@ -1627,7 +1659,8 @@ const saveSettings = async () => {
       custom_bd_name: settings.value.custom_bd_name.trim(),
       node_1_name: settings.value.node_1_name.trim(), node_2_name: settings.value.node_2_name.trim(), node_3_name: settings.value.node_3_name.trim(), node_4_name: settings.value.node_4_name.trim(),
       csp_static: settings.value.csp_static || '',
-      csp_api: settings.value.csp_api || ''
+      csp_api: settings.value.csp_api || '',
+      ua: String(settings.value.ua ?? '').trim()
     }
   }
 
@@ -1743,12 +1776,12 @@ const getUninstallCommand = () => {
   if (isGo) {
     if (deleteTargetOs.value === 'windows') {
       const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.ps1')
-      const proxyParam = proxy ? ` ${quotePowerShellArg(`--install-ghproxy=${proxy}`)}` : ''
+      const proxyParam = proxy ? ` --install-ghproxy=${quotePowerShellArg(proxy)}` : ''
       return `$script = "$env:TEMP\\install-cf-probe.ps1"; Invoke-WebRequest -Uri ${quotePowerShellArg(ghUrl)} -OutFile $script -UseBasicParsing; PowerShell -ExecutionPolicy Bypass -File $script uninstall${proxyParam}`
     }
     const sudoPrefix = deleteTargetOs.value === 'mac' ? 'sudo ' : ''
     const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.sh')
-    const proxyParam = proxy ? ` ${quotePosixShellArg(`--install-ghproxy=${proxy}`)}` : ''
+    const proxyParam = proxy ? ` --install-ghproxy=${quotePosixShellArg(proxy)}` : ''
     const uninstallCommand = `curl -fsSL ${quotePosixShellArg(ghUrl)} | ${sudoPrefix}sh -s -- uninstall${proxyParam}`
     if (deleteTargetOs.value === 'linux' && deleteInstallMode.value === 'cfsm-user') {
       return buildUninstallAsCfsmCommand(uninstallCommand)
@@ -1873,49 +1906,64 @@ const buildInstallAsCfsmCommand = (command, runStep) => {
   return lines.join('\n')
 }
 
+// 站点 UA 不是默认值时，安装命令必须带上：否则首次上报就会被 /update 的防火墙规则拦截，
+// 连自动发现都无法完成。
+const installUserAgent = () => {
+  const ua = String(settings.value.ua ?? '').trim()
+  return ua && ua !== 'cfsm' ? ua : ''
+}
+
 const getCustomInstallCommand = () => {
   const HOST = selectedApiBase.value
   const autoUpdateFlag = autoUpdate.value ? 1 : 0
   const proxy = installGhProxy.value.trim()
   const version = installVersion.value.trim()
   const isDedicatedUserInstall = targetOs.value === 'linux' && installMode.value === 'cfsm-user'
-  // 安装命令只保留必须写入本地的参数：id / secret / url / auto_update。
+  // 安装命令只保留必须写入本地的参数：id / secret / url / auto_update，
+  // 以及站点 UA 非默认值时的 -ua（否则首次上报就会被 /update 的防火墙规则拦下）。
   // collect_interval、interval、connection_mode、ping_mode、reset_day、ct/cu/cm/bd、node_1..4、interface、rx/tx_correction
   // 等属于后端 /api 动态下发的配置（见 agentConfig.buildAgentConfig），Agent 启动后会自动拉取，无需写进安装命令。
   if (targetOs.value === 'windows') {
     const params = [
       'install'
     ]
-    if (proxy) params.push(quotePowerShellArg(`--install-ghproxy=${proxy}`))
-    if (version) params.push(quotePowerShellArg(`--install-version=${version}`))
+    if (proxy) params.push(`--install-ghproxy=${quotePowerShellArg(proxy)}`)
+    if (version) params.push(`--install-version=${quotePowerShellArg(version)}`)
     params.push(
       `-id='${copyServerId.value}'`,
       `-secret=${quotePowerShellArg(apiSecret.value)}`,
       `-url='${HOST}/update'`,
       `-auto_update='${autoUpdateFlag}'`
     )
+    const ua = installUserAgent()
+    if (ua) params.push(`-ua=${quotePowerShellArg(ua)}`)
     const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.ps1')
     return `$script = "$env:TEMP\\install-cf-probe.ps1"; Invoke-WebRequest -Uri ${quotePowerShellArg(ghUrl)} -OutFile $script -UseBasicParsing; PowerShell -ExecutionPolicy Bypass -File $script ${params.join(' ')}`
   }
   if (targetOs.value === 'docker') {
     const safeTag = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$/.test(version) ? version : 'latest'
     const image = `ghcr.io/huilang-me/cfsm-agent:${safeTag}`
+    const ua = installUserAgent()
+    const uaEnv = ua ? ` -e UA=${quotePosixShellArg(ua)}` : ''
     return [
-      'docker run -d --name cf-probe --restart=unless-stopped --network=host \\',
+      'docker run -d --name cf-probe --restart=unless-stopped --network=host --pid=host --cap-drop=ALL --cap-add=NET_RAW \\',
       '  -v cf-probe-data:/data \\',
-      `  -e SERVER_ID=${quotePosixShellArg(copyServerId.value)} -e SECRET=${quotePosixShellArg(apiSecret.value)} -e WORKER_URL=${quotePosixShellArg(`${HOST}/update`)} \\`,
+      '  -v /etc/os-release:/etc/os-release:ro \\',
+      `  -e SERVER_ID=${quotePosixShellArg(copyServerId.value)} -e SECRET=${quotePosixShellArg(apiSecret.value)} -e WORKER_URL=${quotePosixShellArg(`${HOST}/update`)}${uaEnv} \\`,
       `  ${image}`
     ].join('\n')
   }
   const params = ['install']
-  if (proxy) params.push(quotePosixShellArg(`--install-ghproxy=${proxy}`))
-  if (version) params.push(quotePosixShellArg(`--install-version=${version}`))
+  if (proxy) params.push(`--install-ghproxy=${quotePosixShellArg(proxy)}`)
+  if (version) params.push(`--install-version=${quotePosixShellArg(version)}`)
   params.push(
     `-id=${copyServerId.value}`,
     `-secret=${quotePosixShellArg(apiSecret.value)}`,
     `-url=${HOST}/update`,
     `-auto_update=${autoUpdateFlag}`
   )
+  const ua = installUserAgent()
+  if (ua) params.push(`-ua=${quotePosixShellArg(ua)}`)
   const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.sh')
   const installCommand = `curl -fsSL ${quotePosixShellArg(ghUrl)} | sh -s -- ${params.join(' ')}`
   if (!isDedicatedUserInstall) return installCommand
@@ -1923,18 +1971,87 @@ const getCustomInstallCommand = () => {
   return buildInstallAsCfsmCommand(installCommand, trans.value.nonRootInstallRunStep)
 }
 
-// 自动发现模式下安装命令不带 -id：Agent 首次上报时由服务端自动创建服务器
-const autoDiscoveryInstallCommand = computed(() => {
+// 自动发现模式下安装命令不带 -id：Agent 首次上报时由服务端自动创建服务器。
+// name 留空时服务端回退到请求来源 IP；安装用户、代理、版本、名称与自动更新仅影响本次生成的命令。
+const buildAutoDiscoveryCommand = ({ targetOs: os = 'linux', installMode: mode = 'current-user', ghProxy = '', name = '', version = '', autoUpdate = false } = {}) => {
   const HOST = selectedApiBase.value
-  const params = [
-    'install',
+  const proxy = String(ghProxy || '').trim()
+  const agentVersion = String(version || '').trim()
+  const autoUpdateFlag = autoUpdate ? 1 : 0
+  const serverName = String(name || '')
+    .replace(/[\u0000-\u001f\u007f]/g, '')
+    .trim()
+    .slice(0, 100)
+
+  if (os === 'windows') {
+    const params = ['install']
+    if (proxy) params.push(`--install-ghproxy=${quotePowerShellArg(proxy)}`)
+    if (agentVersion) params.push(`--install-version=${quotePowerShellArg(agentVersion)}`)
+    params.push(
+      `-secret=${quotePowerShellArg(apiSecret.value)}`,
+      `-url='${HOST}/update'`,
+      `-auto_update='${autoUpdateFlag}'`
+    )
+    if (serverName) params.push(`-name=${quotePowerShellArg(serverName)}`)
+    const ua = installUserAgent()
+    if (ua) params.push(`-ua=${quotePowerShellArg(ua)}`)
+    const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.ps1')
+    return `$script = "$env:TEMP\\install-cf-probe.ps1"; Invoke-WebRequest -Uri ${quotePowerShellArg(ghUrl)} -OutFile $script -UseBasicParsing; PowerShell -ExecutionPolicy Bypass -File $script ${params.join(' ')}`
+  }
+
+  const params = ['install']
+  if (proxy) params.push(`--install-ghproxy=${quotePosixShellArg(proxy)}`)
+  if (agentVersion) params.push(`--install-version=${quotePosixShellArg(agentVersion)}`)
+  params.push(
     `-secret=${quotePosixShellArg(apiSecret.value)}`,
     `-url=${HOST}/update`,
-    '-auto_update=0'
-  ]
-  const ghUrl = buildGhRawUrl('', '/huilang-me/cfsm-agent/main/install.sh')
-  return `curl -fsSL ${quotePosixShellArg(ghUrl)} | sh -s -- ${params.join(' ')}`
+    `-auto_update=${autoUpdateFlag}`
+  )
+  if (serverName) params.push(`-name=${quotePosixShellArg(serverName)}`)
+  const ua = installUserAgent()
+  if (ua) params.push(`-ua=${quotePosixShellArg(ua)}`)
+  const ghUrl = buildGhRawUrl(proxy, '/huilang-me/cfsm-agent/main/install.sh')
+  const installCommand = `curl -fsSL ${quotePosixShellArg(ghUrl)} | sh -s -- ${params.join(' ')}`
+  if (os !== 'linux' || mode !== 'cfsm-user') return installCommand
+
+  return buildInstallAsCfsmCommand(installCommand, trans.value.nonRootInstallRunStep)
+}
+
+const getAutoDiscoveryInstallCommand = () => buildAutoDiscoveryCommand({
+  targetOs: autoDiscoveryTargetOs.value,
+  installMode: autoDiscoveryInstallMode.value,
+  ghProxy: autoDiscoveryGhProxy.value,
+  name: autoDiscoveryName.value,
+  version: autoDiscoveryVersion.value,
+  autoUpdate: autoDiscoveryAutoUpdate.value
 })
+
+const openAutoDiscoveryModal = () => {
+  if (!savedAutoDiscovery.value) {
+    alertMessage.value = trans.value.autoAddDisabledTip
+    return
+  }
+
+  autoDiscoveryCopied.value = false
+  showAutoDiscoveryModal.value = true
+}
+
+const closeAutoDiscoveryModal = () => {
+  showAutoDiscoveryModal.value = false
+}
+
+const copyAutoDiscoveryCmd = async () => {
+  const copied = await copyTextToClipboard(getAutoDiscoveryInstallCommand())
+  if (!copied) {
+    alertMessage.value = trans.value.httpsRequired
+    return
+  }
+
+  autoDiscoveryCopied.value = true
+  setTimeout(() => {
+    autoDiscoveryCopied.value = false
+  }, 1500)
+}
 
 const copyCustomCmd = async () => {
   const cmd = getCustomInstallCommand()
